@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"strconv"
 	"sync"
 	"time"
@@ -187,12 +188,9 @@ func connectNode(jobsChan chan<- *XmrigJob, solutionsChan <-chan XmrigSubmitRequ
 			}
 			if job != nil {
 				log.Printf("Received %s job on height %d diff=%d", job.Algorithm, job.Height, job.Difficulty)
-				currentJob.lock.Lock()
-				if currentJob.job == nil || !(currentJob.job.Algorithm == "pause" && job.Algorithm == "pause") {
+				if currentJob.setJob(job) {
 					jobsChan <- job
 				}
-				currentJob.job = job
-				currentJob.lock.Unlock()
 			}
 		}
 	}()
@@ -204,13 +202,9 @@ func connectNode(jobsChan chan<- *XmrigJob, solutionsChan <-chan XmrigSubmitRequ
 			return ctx.Err()
 		case solution := <-solutionsChan:
 			log.Printf("Got solution: %#v", solution)
+			currentJob.incrBlocks()
 			jobID, _ := strconv.Atoi(solution.JobID)
-			var height uint64
-			currentJob.lock.RLock()
-			if currentJob.job != nil {
-				height = currentJob.job.Height
-			}
-			currentJob.lock.RUnlock()
+			height := currentJob.getHeight()
 			nonceBytes, err := hex.DecodeString(solution.Nonce)
 			if err != nil {
 				log.Fatal(err)
@@ -343,8 +337,46 @@ func handleConn(conn net.Conn, connJobs <-chan *XmrigJob, solutionsChan chan<- X
 }
 
 type currentJob struct {
-	job  *XmrigJob
-	lock *sync.RWMutex
+	job         *XmrigJob
+	foundBlocks uint64
+	lock        *sync.RWMutex
+}
+
+func (currentJob *currentJob) getHeight() uint64 {
+	currentJob.lock.RLock()
+	defer currentJob.lock.RUnlock()
+	if currentJob.job == nil {
+		return 0
+	}
+	return currentJob.job.Height
+}
+
+func (currentJob *currentJob) getJob() *XmrigJob {
+	currentJob.lock.RLock()
+	defer currentJob.lock.RUnlock()
+	return currentJob.job
+}
+
+func (currentJob *currentJob) getFoundBlocks() uint64 {
+	currentJob.lock.RLock()
+	defer currentJob.lock.RUnlock()
+	return currentJob.foundBlocks
+}
+
+func (currentJob *currentJob) incrBlocks() {
+	currentJob.lock.Lock()
+	currentJob.foundBlocks += 1
+	currentJob.lock.Unlock()
+}
+
+func (currentJob *currentJob) setJob(job *XmrigJob) (res bool) {
+	currentJob.lock.Lock()
+	if currentJob.job == nil || !(currentJob.job.Algorithm == "pause" && job.Algorithm == "pause") {
+		res = true
+	}
+	currentJob.job = job
+	currentJob.lock.Unlock()
+	return
 }
 
 func main() {
@@ -359,6 +391,14 @@ func main() {
 				time.Sleep(time.Second)
 			}
 		}
+	}()
+
+	http.HandleFunc("/blocks", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "Mined %d blocks.", currentJob.getFoundBlocks())
+	})
+
+	go func() {
+		http.ListenAndServe(":4441", nil)
 	}()
 
 	// create broadcasting goroutine
@@ -397,11 +437,10 @@ func main() {
 		}
 		connJobs := make(chan *XmrigJob, 1)
 		connsChan <- connJobs
-		currentJob.lock.RLock()
-		if currentJob.job != nil {
-			connJobs <- currentJob.job
+		job := currentJob.getJob()
+		if job != nil {
+			connJobs <- job
 		}
-		currentJob.lock.RUnlock()
 		go handleConn(conn, connJobs, solutionsChan)
 	}
 }
