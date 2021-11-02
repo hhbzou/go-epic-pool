@@ -255,8 +255,11 @@ func writeJSON(writer *bufio.Writer, value interface{}) (err error) {
 	return writer.Flush()
 }
 
-func handleConn(conn net.Conn, connJobs <-chan *XmrigJob, solutionsChan chan<- XmrigSubmitRequest) {
-	defer conn.Close()
+func handleConn(conn net.Conn, connJobs <-chan *XmrigJob, solutionsChan chan<- XmrigSubmitRequest, currentJob *currentJob) {
+	defer func() {
+		conn.Close()
+		currentJob.decrConns()
+	}()
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 	responses := make(chan XmrigResponse, 10)
@@ -339,6 +342,7 @@ func handleConn(conn net.Conn, connJobs <-chan *XmrigJob, solutionsChan chan<- X
 type currentJob struct {
 	job         *XmrigJob
 	foundBlocks uint64
+	conns       uint64
 	lock        *sync.RWMutex
 }
 
@@ -361,6 +365,24 @@ func (currentJob *currentJob) getFoundBlocks() uint64 {
 	currentJob.lock.RLock()
 	defer currentJob.lock.RUnlock()
 	return currentJob.foundBlocks
+}
+
+func (currentJob *currentJob) activeConns() uint64 {
+	currentJob.lock.RLock()
+	defer currentJob.lock.RUnlock()
+	return currentJob.conns
+}
+
+func (currentJob *currentJob) decrConns() {
+	currentJob.lock.Lock()
+	currentJob.conns -= 1
+	currentJob.lock.Unlock()
+}
+
+func (currentJob *currentJob) incrConns() {
+	currentJob.lock.Lock()
+	currentJob.conns += 1
+	currentJob.lock.Unlock()
 }
 
 func (currentJob *currentJob) incrBlocks() {
@@ -394,7 +416,7 @@ func main() {
 	}()
 
 	http.HandleFunc("/blocks", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "Mined %d blocks.", currentJob.getFoundBlocks())
+		fmt.Fprintf(w, "Mined %d blocks.\nActive connections: %d.\n", currentJob.getFoundBlocks(), currentJob.activeConns())
 	})
 
 	go func() {
@@ -435,12 +457,13 @@ func main() {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
+		currentJob.incrConns()
 		connJobs := make(chan *XmrigJob, 1)
 		connsChan <- connJobs
 		job := currentJob.getJob()
 		if job != nil {
 			connJobs <- job
 		}
-		go handleConn(conn, connJobs, solutionsChan)
+		go handleConn(conn, connJobs, solutionsChan, currentJob)
 	}
 }
